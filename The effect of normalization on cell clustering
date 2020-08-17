@@ -1,0 +1,166 @@
+setwd("/Users/suifangmao/Task")
+library(Seurat)
+library(dplyr)
+library(cowplot)
+# 1 load GEO data
+
+sample <- c("Regional_Duo_M1", "Regional_Duo_M2",
+            "Regional_Il_M1", "Regional_Il_M2",
+            "Regional_Jej_M1", "Regional_Jej_M2")
+
+
+
+for (file in sample){
+  seurat_data <- Read10X(data.dir = paste0("data/", file, "/"))
+  seurat_obj <- CreateSeuratObject(counts = seurat_data, 
+                                   project = file)
+  assign(file, seurat_obj)
+}
+# merge Duodenum, Jejunum, and Ileum respectively: 
+#merged_Duo <- merge(x = Regional_Duo_M1, y = Regional_Duo_M2, add.cell.id = c("Duo_M1", "Duo_M2"))
+#merged_Il <- merge(x = Regional_Il_M1, y = Regional_Il_M2, add.cell.id = c("Il_M1", "Il_M2"))
+#merged_Jej <- merge(x = Regional_Jej_M1, y = Regional_Jej_M2, add.cell.id = c("Jej_M1", "Jej_M2"))
+# merged_Duo: 27998 features across 4554 samples
+# merged_Il: 27998 features across 4303 samples
+# merged_Jej: 27998 features across 4496 samples
+
+other <- c(Regional_Duo_M2, Regional_Il_M1, Regional_Il_M2, Regional_Jej_M1, Regional_Jej_M2 )
+intest <- merge(x = Regional_Duo_M1, y = other, add.cell.id = c("Duo_M1", "Duo_M2","Il_M1","Il_M2","Jej_M1","Jej_M2"))
+intest
+#An object of class Seurat 
+#27998 features across 13353 samples within 1 assay
+#Active assay: RNA (27998 features, 0 variable features)
+saveRDS(intest, file = "data/intest_raw.rds")
+
+#2 Pre-processing
+
+#2-1 QC
+# % MT (note: in mouse dataset, they used"mt-" to label "mitochondrial gene)
+intest <- readRDS("data/intest_raw.rds")
+mito.genes <- grep(pattern = "mt-", x = rownames(intest@assays[["RNA"]]), value = TRUE)
+percent.mito <- Matrix::colSums(intest@assays[["RNA"]][mito.genes, ])/Matrix::colSums(intest@assays[["RNA"]])
+intest<-AddMetaData(object = intest, metadata = percent.mito, col.name ="percent.mito")
+
+# to look at 3 QC metrics by using pbmc$nFeature_RNA, or $nCount_RNA, $percent.mito)
+VlnPlot(object = intest, features = c("nFeature_RNA", "nCount_RNA", "percent.mito"), ncol = 3)
+# Data quality summary plots
+FeatureScatter(intest, "nCount_RNA"  , "nFeature_RNA", group.by = "orig.ident", pt.size = .5)
+# FeatureScatter(intest, "nCount_RNA", "nFeature_RNA", group.by = "percent.mito", pt.size = .5)
+# take too long to plot
+
+## Filter cells according to identified QC thresholds:
+# count: >1500, <40000
+# genes >= 700
+# mt% < 0.2%
+intest <- subset(x = intest, subset = nCount_RNA >= 1500)
+intest
+#27998 features across 12874 samples
+intest <- subset(x = intest, subset = nCount_RNA <= 40000)
+intest
+#27998 features across 12858 samples
+intest <- subset(x = intest, subset = nFeature_RNA >= 700)
+intest
+#27998 features across 12457 samples
+intest <- subset(x = intest, subset = percent.mito <= 0.2 )
+intest
+#27998 features across 12457 samples
+
+# gene filter: genes detected less than 20 cells
+FilterGenes <-
+  function (object, min.value=0, min.cells = 0, genes = NULL) {
+    genes.use <- rownames(object)
+    if (!is.null(genes)) {
+      genes.use <- intersect(genes.use, genes)
+      object@data <- GetAssayData(object)[genes.use, ]
+    } else if (min.cells > 0) {
+      num.cells <- Matrix::rowSums(GetAssayData(object) > min.value)
+      genes.use <- names(num.cells[which(num.cells >= min.cells)])
+      object = object[genes.use, ]
+    }
+    object <- LogSeuratCommand(object = object)
+    return(object)
+  }
+
+intest <- FilterGenes(object = intest, min.cells = 20)
+intest
+#12818 features across 12457 samples within 1 assay 
+
+saveRDS(intest, file = "data/intest_qc.rds")
+
+#2-2 Normalization and scaling
+
+intest<-readRDS("data/intest_qc.rds")
+
+# CPM normalization
+intest_cpm <- NormalizeData(object = intest, normalization.method = "RC", scale.factor = 1e6)
+# LogNormalization
+intest_logN<- NormalizeData(object = intest, normalization.method = "LogNormalize", scale.factor = 10000)
+
+# 2-3 Find HVG
+intest_cpm <- FindVariableFeatures(object = intest_cpm, mean.function = ExpMean, dispersion.function = LogVMR, x.low.cutoff = 0.0125, x.high.cutoff = 3, y.cutoff = 0.5, nfeatures = 2000)
+intest_logN <- FindVariableFeatures(object = intest_logN, mean.function = ExpMean, dispersion.function = LogVMR, x.low.cutoff = 0.0125, x.high.cutoff = 3, y.cutoff = 0.5, nfeatures = 2000)
+head(x = HVFInfo(object = intest_cpm))
+head(x = HVFInfo(object = intest_logN))
+
+# 2-4 Scaling
+intest_cpm <- ScaleData(object = intest_cpm, vars.to.regress = c("nCounts_RNA", "percent.mito"))
+intest_logN <- ScaleData(object = intest_logN, vars.to.regress = c("nCounts_RNA", "percent.mito"))
+
+
+saveRDS(intest_cpm, file = "data/intest_cpm.rds")
+saveRDS(intest_logN, file = "data/intest_logN.rds")
+
+#3-1 Visualization on PCA
+intest_cpm<-readRDS("data/intest_cpm.rds")
+intest_logN<-readRDS("data/intest_logN.rds")
+
+intest_cpm <- RunPCA(object = intest_cpm,  npcs = 15, verbose = FALSE)
+intest_logN <- RunPCA(object = intest_logN,  npcs = 15, verbose = FALSE)
+
+cowplot::plot_grid(ncol = 2,
+DimPlot(object = intest_cpm, reduction = "pca"),
+DimPlot(object = intest_logN, reduction = "pca")
+)
+
+DimPlot(object = intest_cpm, reduction = "pca")
+DimPlot(object = intest_logN, reduction = "pca")
+
+##3-2 Visualization on UMAP
+intest_cpm_u <- RunUMAP(intest_cpm, reduction = "pca", dims = 1:15)
+intest_logN_u <- RunUMAP(intest_logN, reduction = "pca", dims = 1:15)
+
+cowplot::plot_grid(ncol = 2,
+DimPlot(intest_cpm_u, reduction = "umap"),
+DimPlot(intest_logN_u, reduction = "umap")
+)
+DimPlot(intest_cpm_u, reduction = "umap")
+DimPlot(intest_logN_u, reduction = "umap")
+
+## 4 Clustering
+
+#4-1 CPM-based clustering
+intest_cpm <- FindNeighbors(intest_cpm, reduction = "pca", dims = 1:15)
+# Number of nodes: 12457
+# Number of edges: 403562
+intest_cpm <- FindClusters(intest_cpm, resolution = 0.5, algorithm = 1)
+# Maximum modularity in 10 random starts: 0.8797
+# Number of communities: 12
+intest_cpm$seurat_clusters
+intest_cpm_cluster <- RunUMAP(intest_cpm, reduction = "pca", dims = 1:15)
+
+#4-2 logN-based clustering
+intest_logN <- FindNeighbors(intest_logN, reduction = "pca", dims = 1:15)
+intest_logN <- FindClusters(intest_logN, resolution = 0.5, algorithm = 1)
+# Number of nodes: 12457
+# Number of edges: 398885
+# Maximum modularity in 10 random starts: 0.8757
+# Number of communities: 13
+intest_logN$seurat_clusters
+intest_logN_cluster <- RunUMAP(intest_logN, reduction = "pca", dims = 1:15)
+DimPlot(intest_cpm_cluster, reduction = "umap", label = TRUE)
+DimPlot(intest_logN_cluster, reduction = "umap", label = TRUE)
+
+cowplot::plot_grid(ncol = 2,
+DimPlot(intest_cpm_cluster, reduction = "umap", label = TRUE),
+DimPlot(intest_logN_cluster, reduction = "umap", label = TRUE)
+)
